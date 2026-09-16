@@ -1,0 +1,21 @@
+name: tricoredb
+description: >-
+  Dart driver for TriCoreDB's native tricore protocol: SQL with server-side
+  parameters, transactions, documents, vectors, graphs, cache and LLM context,
+  over TCP or TLS, with no dependencies.
+version: 0.1.0
+repository: https://github.com/trinesh14/tricoredb-sdk-dart
+issue_tracker: https://github.com/trinesh14/tricoredb-sdk-dart/issues
+documentation: https://pub.dev/documentation/tricoredb/latest/
+topics:
+  - database
+  - sql
+  - client
+  - driver
+
+environment:
+  sdk: ^3.3.0
+
+dev_dependencies:
+  lints: ^4.0.0
+  test: ^1.25.0
