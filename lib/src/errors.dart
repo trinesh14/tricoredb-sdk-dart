@@ -1,6 +1,11 @@
 /// The code a not-leader refusal carries in `diagnostics.error_code`.
 const String notLeaderCode = 'not_leader';
 
+/// The code of a request a follower handed to the leader and lost the answer
+/// to, or one the leader could not confirm. It may or may not have been
+/// applied, so the client never sends it again.
+const String outcomeUnknownCode = 'outcome_unknown';
+
 /// Every failure this package raises.
 ///
 /// Branch on [code], never on [message]: the message is prose the server may
@@ -20,9 +25,8 @@ class TriCoreException implements Exception {
 
   /// Whether the request was right but reached a node that is not the leader.
   ///
-  /// This driver never follows [leaderHint] on its own: the address may not be
-  /// reachable from here, a new connection has to authenticate again, and an
-  /// open session transaction cannot move to another node at all.
+  /// Unless `followLeader` is off, the client has already sent the request
+  /// again before throwing this.
   bool get isRedirect => code == notLeaderCode;
 
   @override

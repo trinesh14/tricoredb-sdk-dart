@@ -52,6 +52,9 @@ class TriCorePool {
     TlsOptions? tls,
     int size = 8,
     Duration? checkoutTimeout,
+    bool followLeader = true,
+    int leaderRetries = 5,
+    Duration leaderRetryDelay = const Duration(milliseconds: 250),
   }) {
     return TriCorePool(
       () => TriCore.connect(
@@ -64,6 +67,9 @@ class TriCorePool {
         readTimeout: readTimeout,
         requestTimeout: requestTimeout,
         tls: tls,
+        followLeader: followLeader,
+        leaderRetries: leaderRetries,
+        leaderRetryDelay: leaderRetryDelay,
       ),
       size: size,
       checkoutTimeout: checkoutTimeout,

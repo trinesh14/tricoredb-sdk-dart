@@ -87,7 +87,8 @@ class ScriptedPeer {
     return ScriptedPeer._(server, steps);
   }
 
-  /// Connect a client to this peer.
+  /// Connect a client to this peer. A scripted peer plays one conversation, so
+  /// following the leader is off here.
   Future<TriCore> connect({
     String? user = 'admin',
     int features = Features.all,
@@ -101,6 +102,7 @@ class ScriptedPeer {
       features: features,
       connectTimeout: const Duration(seconds: 5),
       readTimeout: readTimeout,
+      followLeader: false,
     );
   }
 

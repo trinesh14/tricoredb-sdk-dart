@@ -51,7 +51,7 @@ or, in `pubspec.yaml`:
 
 ```yaml
 dependencies:
-  tricoredb: ^0.1.0
+  tricoredb: ^0.2.0
 ```
 
 ## Running a server
@@ -110,6 +110,27 @@ final db = await TriCore.connect(
 `readTimeout` bounds each reply afterwards: when it fires the connection is
 closed, because a late reply would otherwise be read as the answer to the next
 request. `requestTimeout` is a deadline the **server** applies.
+
+### Following the leader
+
+In a cluster only the leader accepts writes, and a follower refuses with
+`not_leader`. The client handles that itself (`followLeader: true`, the
+default):
+
+- when the refusal names the leader, it opens a connection there with the same
+  user, secret and TLS settings (the leader's host is the certificate name),
+  sends the request again, and keeps that connection (`db.address` reports it);
+- while an election is in progress (no leader named), it waits and asks the same
+  node again, pausing 250 ms, then 500 ms, up to 2 s (`leaderRetryDelay`);
+- after `leaderRetries` (5) it throws the last refusal.
+
+This is safe because a `not_leader` refusal was applied nowhere. Nothing is sent
+again inside a session transaction, and never a refusal with
+`outcomeUnknownCode`: a follower handed that request to the leader and lost the
+answer, or the leader could not confirm it, so it may have been applied. The
+leader's address must be reachable from your application; when it is not, the
+client keeps its connection and waits. `TriCorePool.to` takes the same three
+options. Pass `followLeader: false` to handle redirects yourself.
 
 A connection is a single request/response stream. Calls made from several places
 at once are queued, so they are safe but not concurrent — for concurrency, use a
@@ -308,10 +329,9 @@ try {
   await db.execute('INSERT INTO t VALUES (1)');
 } on ServerException catch (e) {
   if (e.isRedirect) {
-    // This node is not the leader. e.leaderHint names the one that is, when
-    // the cluster knows. This driver never follows the hint by itself: the
-    // address may not be reachable from here, a new connection has to
-    // authenticate again, and an open transaction cannot move nodes.
+    // No node would serve it, even after following the leader (or
+    // followLeader is off). e.leaderHint names the leader when the cluster
+    // knows one.
     print(e.leaderHint);
   }
 } on ConnectionException {

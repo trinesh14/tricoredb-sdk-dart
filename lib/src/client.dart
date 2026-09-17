@@ -38,8 +38,10 @@ const String defaultDatabase = 'main';
 /// ```
 class TriCore {
   static const Duration _closeTimeout = Duration(seconds: 2);
+  static const Duration _maxLeaderRetryDelay = Duration(seconds: 2);
+  static const Duration _followConnectTimeout = Duration(seconds: 3);
 
-  final Transport _transport;
+  Transport _transport;
 
   /// The database used when a call does not name one.
   String database;
@@ -51,6 +53,24 @@ class TriCore {
   /// A server-side deadline sent with every request. Null lets the server use
   /// its own.
   Duration? requestTimeout;
+
+  /// Send a request again when a cluster node refuses it with `not_leader`.
+  ///
+  /// The request goes to the leader the refusal names, over a new connection
+  /// that replaces this one (same user, secret and TLS settings, with the
+  /// leader's host as the certificate name), or, while no leader is known, to
+  /// the same node after a pause. That is safe because a `not_leader` refusal
+  /// was applied nowhere. It never happens inside a session transaction.
+  bool followLeader = true;
+
+  /// How many times a refused request is sent again.
+  int leaderRetries = 5;
+
+  /// The first pause before asking again; it doubles up to two seconds.
+  Duration leaderRetryDelay = const Duration(milliseconds: 250);
+
+  String _address = '';
+  _ConnectOptions? _connectOptions;
 
   Future<void> _gate = Future<void>.value();
   int _requestCounter = 0;
@@ -78,6 +98,9 @@ class TriCore {
     TlsOptions? tls,
     String? clientName,
     int features = Features.all,
+    bool followLeader = true,
+    int leaderRetries = 5,
+    Duration leaderRetryDelay = const Duration(milliseconds: 250),
   }) async {
     final transport = await Transport.connect(
       host,
@@ -104,8 +127,24 @@ class TriCore {
     }
     client.readTimeout = readTimeout;
     client.requestTimeout = requestTimeout;
+    client.followLeader = followLeader;
+    client.leaderRetries = leaderRetries;
+    client.leaderRetryDelay = leaderRetryDelay;
+    client._address = _joinAddress(host, port);
+    client._connectOptions = _ConnectOptions(
+      user: user,
+      secret: secret,
+      connectTimeout: connectTimeout,
+      tls: tls,
+      clientName: clientName,
+      features: features,
+    );
     return client;
   }
+
+  /// The `host:port` this connection talks to. It changes when the client
+  /// follows the leader.
+  String get address => _address;
 
   /// Which capabilities the server granted in the handshake.
   GrantedFeatures get grantedFeatures => _granted;
@@ -284,6 +323,35 @@ class TriCore {
         'llm': null,
       };
     }
+    var pause = leaderRetryDelay;
+    for (var retried = 0;; retried++) {
+      final response = await _sendRequest(payload);
+      if (response.isOk) return response;
+      // A `not_leader` refusal was applied nowhere, so sending it again cannot
+      // apply it twice. A session transaction belongs to this connection.
+      if (response.isRedirect &&
+          followLeader &&
+          !_transactionOpen &&
+          retried < leaderRetries) {
+        final hint = response.leaderHint;
+        if (hint != null && hint != _address && await _moveTo(hint)) continue;
+        await Future<void>.delayed(pause);
+        final doubled = pause * 2;
+        pause = doubled < const Duration(milliseconds: 1)
+            ? const Duration(milliseconds: 1)
+            : (doubled > _maxLeaderRetryDelay ? _maxLeaderRetryDelay : doubled);
+        continue;
+      }
+      final error = response.toException(
+        transactionOpen: _transactionOpen,
+        retried: followLeader ? retried : null,
+      );
+      if (response.isRedirect) _transactionOpen = false;
+      throw error;
+    }
+  }
+
+  Future<Response> _sendRequest(Map<String, Object?> payload) async {
     final frame = await _exchange(Frame.request, payload);
     if (frame.tag == Frame.error) {
       throw ServerException(
@@ -298,14 +366,68 @@ class TriCore {
         ProtocolException('expected RESPONSE, got ${Frame.name(frame.tag)}'),
       );
     }
-    final response = Response.fromJson(frame.body);
-    if (!response.isOk) {
-      final error = response.toException(transactionOpen: _transactionOpen);
-      if (response.isRedirect) _transactionOpen = false;
-      throw error;
-    }
-    return response;
+    return Response.fromJson(frame.body);
   }
+
+  /// Replace this connection with one to [target], opened the way this one
+  /// was. False, leaving this connection untouched, when that fails.
+  Future<bool> _moveTo(String target) async {
+    final options = _connectOptions;
+    final parsed = _splitAddress(target);
+    if (options == null || parsed == null) return false;
+    final (host, port) = parsed;
+    final budget = options.connectTimeout;
+    final TriCore fresh;
+    try {
+      fresh = await TriCore.connect(
+        host: host,
+        port: port,
+        user: options.user,
+        secret: options.secret,
+        database: database,
+        connectTimeout: budget == null || budget > _followConnectTimeout
+            ? _followConnectTimeout
+            : budget,
+        tls: options.tls == null
+            ? null
+            // The leader's certificate is checked against the name the hint
+            // gives.
+            : TlsOptions(
+                caFile: options.tls!.caFile,
+                serverName: host,
+                clientCertificateFile: options.tls!.clientCertificateFile,
+                clientKeyFile: options.tls!.clientKeyFile,
+                clientKeyPassword: options.tls!.clientKeyPassword,
+                dangerAcceptInvalidCertificates:
+                    options.tls!.dangerAcceptInvalidCertificates,
+              ),
+        clientName: options.clientName,
+        features: options.features,
+        followLeader: false,
+      );
+    } on Object {
+      return false;
+    }
+    final old = _transport;
+    _transport = fresh._transport;
+    _sessionId = fresh._sessionId;
+    _granted = fresh._granted;
+    _address = target;
+    old.close();
+    return true;
+  }
+
+  static (String, int)? _splitAddress(String address) {
+    final match = RegExp(r'^\[([^\]]+)\]:(\d+)$').firstMatch(address) ??
+        RegExp(r'^([^:]+):(\d+)$').firstMatch(address);
+    if (match == null) return null;
+    final port = int.parse(match.group(2)!);
+    if (port < 1 || port > 65535) return null;
+    return (match.group(1)!, port);
+  }
+
+  static String _joinAddress(String host, int port) =>
+      host.contains(':') ? '[$host]:$port' : '$host:$port';
 
   // ---- SQL -----------------------------------------------------------------
 
@@ -2110,4 +2232,24 @@ class VectorHit {
 
   @override
   String toString() => 'VectorHit($id, $score)';
+}
+
+/// What [TriCore.connect] was given, to open a connection to the leader the
+/// same way.
+class _ConnectOptions {
+  final String? user;
+  final String secret;
+  final Duration? connectTimeout;
+  final TlsOptions? tls;
+  final String? clientName;
+  final int features;
+
+  const _ConnectOptions({
+    required this.user,
+    required this.secret,
+    required this.connectTimeout,
+    required this.tls,
+    required this.clientName,
+    required this.features,
+  });
 }

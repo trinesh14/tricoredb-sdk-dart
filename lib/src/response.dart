@@ -168,22 +168,26 @@ class Response {
   }
 
   /// Build the exception for a response that is not `ok`.
-  ServerException toException({bool transactionOpen = false}) {
+  ServerException toException(
+      {bool transactionOpen = false, int? retried = 0}) {
     final message = arm('Message') ??
         (hasArm('Json') ? json.encode(arm('Json')) : null) ??
         'request failed';
     final buffer = StringBuffer('$message (server status: $status)');
     if (isRedirect) {
       buffer.write(leaderHint != null
-          ? ' [not_leader: the leader serves clients at `$leaderHint`. '
-              'This driver does not follow the hint on its own; send the '
-              'request there.'
+          ? ' [not_leader: the leader serves clients at `$leaderHint`.'
           : ' [not_leader: there is no leader address to name (an election is '
-              'in progress, or the leader has no address configured). Wait and '
-              'try again.');
+              'in progress, or the leader has no address configured).');
       if (transactionOpen) {
         buffer.write(' The open session transaction is over: it cannot '
             'continue on another node.');
+      } else if (retried == null) {
+        buffer.write(' Following the leader is off (followLeader: false): '
+            'send the request there yourself.');
+      } else if (retried > 0) {
+        buffer.write(' The client sent it again $retried time(s) and was '
+            'refused each time.');
       }
       buffer.write(']');
     }

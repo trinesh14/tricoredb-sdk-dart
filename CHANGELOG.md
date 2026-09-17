@@ -4,6 +4,24 @@ All notable changes to this package are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 0.2.0
+
+### Added
+
+- Following the leader: a request refused with `not_leader` is sent again, to the
+  leader the refusal names (over a new connection that replaces the current one)
+  or, while no leader is known, to the same node after a pause. On by default;
+  `followLeader: false` restores the previous behaviour, and `leaderRetries` (5)
+  and `leaderRetryDelay` (250 ms) bound it. `TriCorePool.to` takes the same
+  options. Never inside a session transaction.
+- `outcomeUnknownCode`: a request that may or may not have been applied. It is
+  never sent again.
+- `TriCore.address`.
+
+### Changed
+
+- A `not_leader` error message says whether the client already retried.
+
 ## 0.1.0
 
 First release.
