@@ -41,8 +41,10 @@ allow_default_admin = false
 enabled = false
 ''';
 
-  final Process _process;
-  final Directory _directory;
+  final Process? _process;
+  final Directory? _directory;
+  final String _user;
+  final String _secret;
 
   /// The host the server bound to.
   final String host;
@@ -50,12 +52,35 @@ enabled = false
   /// The port it is listening on.
   final int port;
 
-  LiveServer._(this._process, this._directory, this.host, this.port);
+  LiveServer._(
+    this._process,
+    this._directory,
+    this.host,
+    this.port, [
+    this._user = 'admin',
+    this._secret = 'pw',
+  ]);
+
+  /// A server that is already running, named by `TRICORE_HOST` (with
+  /// `TRICORE_PORT`, `TRICORE_USER` and `TRICORE_SECRET`). It is used as it
+  /// is and never stopped.
+  static LiveServer? _running() {
+    final host = Platform.environment['TRICORE_HOST'];
+    if (host == null || host.isEmpty) return null;
+    return LiveServer._(
+      null,
+      null,
+      host,
+      int.parse(Platform.environment['TRICORE_PORT'] ?? '8427'),
+      Platform.environment['TRICORE_USER'] ?? 'admin',
+      Platform.environment['TRICORE_SECRET'] ?? '',
+    );
+  }
 
   /// Why the live tests cannot run, or null when they can.
-  static String? get skipReason => _binary == null
-      ? 'no tricore-server binary: set TRICORE_SERVER_BIN, or run one from '
-          'the Docker image (see the README)'
+  static String? get skipReason => _running() == null && _binary == null
+      ? 'no server: set TRICORE_HOST to one that is running, or '
+          'TRICORE_SERVER_BIN to a binary (see the README)'
       : null;
 
   static final String? _binary = _findBinary();
@@ -81,6 +106,8 @@ enabled = false
 
   /// Start a server, and wait for it to say where it is listening.
   static Future<LiveServer> start() async {
+    final running = _running();
+    if (running != null) return running;
     final binary = _binary;
     if (binary == null) {
       throw StateError('no tricore-server binary');
@@ -133,8 +160,8 @@ enabled = false
   Future<TriCore> connect({Duration? readTimeout}) => TriCore.connect(
         host: host,
         port: port,
-        user: 'admin',
-        secret: 'pw',
+        user: _user,
+        secret: _secret,
         connectTimeout: const Duration(seconds: 15),
         readTimeout: readTimeout,
       );
@@ -143,28 +170,31 @@ enabled = false
   TriCorePool pool({int size = 4}) => TriCorePool.to(
         host: host,
         port: port,
-        user: 'admin',
-        secret: 'pw',
+        user: _user,
+        secret: _secret,
         size: size,
       );
 
   /// Stop the server and remove its data directory.
   Future<void> stop() async {
-    _process.kill();
-    await _process.exitCode.timeout(
+    final process = _process;
+    if (process == null) return;
+    process.kill();
+    await process.exitCode.timeout(
       const Duration(seconds: 10),
       onTimeout: () => 0,
     );
     try {
-      _directory.deleteSync(recursive: true);
+      _directory?.deleteSync(recursive: true);
     } on FileSystemException {
       // A file the server still holds is not worth failing a test run over.
     }
   }
 }
 
-/// A name no other test in this run uses, so tests can share one server.
+/// A name no other test in this run uses, so tests can share one server, and
+/// one that says whose it is when the server is shared with other clients.
 String uniqueName(String prefix) {
   final stamp = DateTime.now().microsecondsSinceEpoch.toRadixString(36);
-  return '${prefix}_$stamp';
+  return 'dart_${prefix}_$stamp';
 }

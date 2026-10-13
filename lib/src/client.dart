@@ -6,6 +6,7 @@ import 'dart:typed_data';
 import 'builders.dart';
 import 'errors.dart';
 import 'frame.dart';
+import 'operations.dart';
 import 'options.dart';
 import 'params.dart';
 import 'response.dart';
@@ -293,12 +294,16 @@ class TriCore {
 
   /// Send a raw operation, such as `{'Cache': 'Ping'}`.
   ///
+  /// [txn] names an open document or graph transaction the request runs
+  /// inside.
+  ///
   /// Returns only when the status is `ok`; any other status throws a
   /// [ServerException] carrying the server's code.
   Future<Response> request(
     Object op, {
     String? database,
     String? correlationId,
+    String? txn,
   }) async {
     final payload = <String, Object?>{
       'request_id': _nextRequestId(),
@@ -321,6 +326,12 @@ class TriCore {
         'consistency': 'strong_primary',
         'timeout_ms': timeout.inMilliseconds,
         'llm': null,
+      };
+    }
+    if (txn != null) {
+      payload['options'] = {
+        ...?(payload['options'] as Map<String, Object?>?),
+        'txn': txn,
       };
     }
     var pause = leaderRetryDelay;
@@ -1125,6 +1136,1008 @@ class TriCore {
     return json['trimmed'] as int;
   }
 
+  /// Store a value that answers as fresh for the given time and as stale
+  /// after it, until its TTL (if any) ends. Returns the instant, in Unix
+  /// milliseconds, it stops being fresh.
+  Future<int> cacheSetFresh(
+    String namespace,
+    String key,
+    Object value,
+    Duration freshFor, {
+    Duration? ttl,
+    String? database,
+  }) async {
+    final response = await _cache(
+        'SetFresh',
+        {
+          'namespace': namespace,
+          'key': key,
+          'value': _bytes(value, 'value'),
+          'fresh_ms': freshFor.inMilliseconds,
+          'ttl_ms': ttl?.inMilliseconds,
+        },
+        database);
+    return _json(response, 'SetFresh')['freshUntilMs'] as int;
+  }
+
+  /// Read with stale-while-revalidate and stampede protection. The state
+  /// is `fresh`, `stale` (with `refresh` true for the one caller holding
+  /// the refresh lease), `missing` (a cached absence) or `miss` (with
+  /// `lease` true for the one caller that should compute the value).
+  Future<FreshRead> cacheGetFresh(
+    String namespace,
+    String key,
+    String owner,
+    Duration lease, {
+    String? database,
+  }) async {
+    final response = await _cache(
+        'GetFresh',
+        {
+          'namespace': namespace,
+          'key': key,
+          'owner': owner,
+          'lease_ms': lease.inMilliseconds,
+        },
+        database);
+    return FreshRead.fromJson(_json(response, 'GetFresh'));
+  }
+
+  /// Negative caching: remember for the given time that the source has no
+  /// value for the key.
+  Future<void> cacheSetMissing(
+    String namespace,
+    String key,
+    Duration ttl, {
+    String? database,
+  }) async {
+    await _cache(
+        'SetMissing',
+        {
+          'namespace': namespace,
+          'key': key,
+          'ttl_ms': ttl.inMilliseconds,
+        },
+        database);
+  }
+
+  /// Cache warming: write the entries that are not already cached,
+  /// leaving live values alone. Answers `written` and `alreadyCached`.
+  Future<Map<String, dynamic>> cacheWarm(
+    String namespace,
+    Map<String, Object> entries, {
+    Duration? ttl,
+    String? database,
+  }) async {
+    final response = await _cache(
+        'Warm',
+        {
+          'namespace': namespace,
+          'entries': _entries(entries),
+          'ttl_ms': ttl?.inMilliseconds,
+        },
+        database);
+    return _json(response, 'Warm');
+  }
+
+  /// Read many values in one request. One result per requested key, in
+  /// order, with null where the key is absent or expired. Not a snapshot.
+  Future<List<Uint8List?>> cacheGetMany(
+    String namespace,
+    List<String> keys, {
+    String? database,
+  }) async {
+    final response = await _cache(
+        'MGet',
+        {
+          'namespace': namespace,
+          'keys': keys,
+        },
+        database);
+    return _cacheValues(response, 'MGet');
+  }
+
+  /// Write many values as one batch, all with the same optional TTL. A
+  /// repeated key is refused. Returns how many were written.
+  Future<int> cacheSetMany(
+    String namespace,
+    Map<String, Object> entries, {
+    Duration? ttl,
+    String? database,
+  }) async {
+    final response = await _cache(
+        'MSet',
+        {
+          'namespace': namespace,
+          'entries': _entries(entries),
+          'ttl_ms': ttl?.inMilliseconds,
+        },
+        database);
+    return _json(response, 'MSet')['set'] as int;
+  }
+
+  /// Write a value under a condition, with explicit control over the TTL.
+  /// False means the condition was not met, not that anything failed.
+  Future<bool> cacheSetIf(
+    String namespace,
+    String key,
+    Object value, {
+    SetCondition condition = SetCondition.always,
+    CacheExpiry expiry = CacheExpiry.clear,
+    String? database,
+  }) async {
+    final response = await _cache(
+        'SetIf',
+        {
+          'namespace': namespace,
+          'key': key,
+          'value': _bytes(value, 'value'),
+          'condition': condition.wire,
+          'expiry': expiry.toJson(),
+        },
+        database);
+    return _json(response, 'SetIf')['set'] == true;
+  }
+
+  /// Add scored members to a sorted set, or re-score ones already there.
+  /// Answers `added` and `updated`. A NaN score is refused.
+  Future<Map<String, dynamic>> cacheSortedAdd(
+    String namespace,
+    String key,
+    Map<Object, double> members, {
+    String? database,
+  }) async {
+    final response = await _cache(
+        'ZAdd',
+        {
+          'namespace': namespace,
+          'key': key,
+          'members': _scored(members),
+        },
+        database);
+    return _json(response, 'ZAdd');
+  }
+
+  /// Remove members from a sorted set, returning how many were present.
+  Future<int> cacheSortedRemove(
+    String namespace,
+    String key,
+    List<Object> members, {
+    String? database,
+  }) async {
+    final response = await _cache(
+        'ZRem',
+        {
+          'namespace': namespace,
+          'key': key,
+          'members': _byteList(members, 'members'),
+        },
+        database);
+    return _json(response, 'ZRem')['removed'] as int;
+  }
+
+  /// The score of one member, or null when it is not in the set.
+  Future<double?> cacheSortedScore(
+    String namespace,
+    String key,
+    Object member, {
+    String? database,
+  }) async {
+    final response = await _cache(
+        'ZScore',
+        {
+          'namespace': namespace,
+          'key': key,
+          'member': _bytes(member, 'member'),
+        },
+        database);
+    return _doubleOrNull(_json(response, 'ZScore')['score']);
+  }
+
+  /// How many members a sorted set holds.
+  Future<int> cacheSortedCount(
+    String namespace,
+    String key, {
+    String? database,
+  }) async {
+    final response = await _cache(
+        'ZCard',
+        {
+          'namespace': namespace,
+          'key': key,
+        },
+        database);
+    return _json(response, 'ZCard')['cardinality'] as int;
+  }
+
+  /// A member's position in the ordering, or null when it is absent.
+  /// `rev` counts from the high-scoring end.
+  Future<int?> cacheSortedRank(
+    String namespace,
+    String key,
+    Object member, {
+    bool rev = false,
+    String? database,
+  }) async {
+    final response = await _cache(
+        'ZRank',
+        {
+          'namespace': namespace,
+          'key': key,
+          'member': _bytes(member, 'member'),
+          'rev': rev,
+        },
+        database);
+    return _intOrNull(_json(response, 'ZRank')['rank']);
+  }
+
+  /// Members by rank, `start..=stop` inclusive. Negative indices count
+  /// from the end, so `0, -1` is the whole set.
+  Future<List<ScoredMember>> cacheSortedRange(
+    String namespace,
+    String key,
+    int start,
+    int stop, {
+    bool rev = false,
+    bool withScores = false,
+    String? database,
+  }) async {
+    final response = await _cache(
+        'ZRange',
+        {
+          'namespace': namespace,
+          'key': key,
+          'start': start,
+          'stop': stop,
+          'rev': rev,
+          'with_scores': withScores,
+        },
+        database);
+    return _scoredMembers(_json(response, 'ZRange'));
+  }
+
+  /// Members by score, between two bounds. `limit` is `(offset, count)`,
+  /// applied after the range is selected.
+  Future<List<ScoredMember>> cacheSortedRangeByScore(
+    String namespace,
+    String key,
+    ScoreBound min,
+    ScoreBound max, {
+    bool rev = false,
+    bool withScores = false,
+    (int, int)? limit,
+    String? database,
+  }) async {
+    final response = await _cache(
+        'ZRangeByScore',
+        {
+          'namespace': namespace,
+          'key': key,
+          'min': min.toJson(),
+          'max': max.toJson(),
+          'rev': rev,
+          'with_scores': withScores,
+          'limit': limit == null ? null : [limit.$1, limit.$2],
+        },
+        database);
+    return _scoredMembers(_json(response, 'ZRangeByScore'));
+  }
+
+  /// Add to a member's score, creating it at that score when absent.
+  /// Returns the resulting score.
+  Future<double> cacheSortedIncrement(
+    String namespace,
+    String key,
+    Object member,
+    double by, {
+    String? database,
+  }) async {
+    final response = await _cache(
+        'ZIncrBy',
+        {
+          'namespace': namespace,
+          'key': key,
+          'member': _bytes(member, 'member'),
+          'by': by,
+        },
+        database);
+    return (_json(response, 'ZIncrBy')['score'] as num).toDouble();
+  }
+
+  /// Take a lease on a lock, or refresh one already held by `owner`.
+  /// Answers `acquired`, `token` (a fencing token that strictly increases
+  /// with every acquisition and is never reused), `holder` and
+  /// `expiresAtMs`.
+  Future<Map<String, dynamic>> cacheLockAcquire(
+    String namespace,
+    String key,
+    String owner,
+    Duration ttl, {
+    String? database,
+  }) async {
+    final response = await _cache(
+        'LockAcquire',
+        {
+          'namespace': namespace,
+          'key': key,
+          'owner': owner,
+          'ttl_ms': ttl.inMilliseconds,
+        },
+        database);
+    return _json(response, 'LockAcquire');
+  }
+
+  /// Extend a lease the caller still holds. Answers `renewed`, `token`
+  /// and `expiresAtMs`. Refused once the lease has lapsed, even if nobody
+  /// else has taken the lock since.
+  Future<Map<String, dynamic>> cacheLockRenew(
+    String namespace,
+    String key,
+    String owner,
+    Duration ttl, {
+    String? database,
+  }) async {
+    final response = await _cache(
+        'LockRenew',
+        {
+          'namespace': namespace,
+          'key': key,
+          'owner': owner,
+          'ttl_ms': ttl.inMilliseconds,
+        },
+        database);
+    return _json(response, 'LockRenew');
+  }
+
+  /// Give up a lock. Only the current, live holder can release it.
+  Future<bool> cacheLockRelease(
+    String namespace,
+    String key,
+    String owner, {
+    String? database,
+  }) async {
+    final response = await _cache(
+        'LockRelease',
+        {
+          'namespace': namespace,
+          'key': key,
+          'owner': owner,
+        },
+        database);
+    return _json(response, 'LockRelease')['released'] == true;
+  }
+
+  /// Set one bit of a string value, growing it with zero bytes if needed.
+  /// Returns the bit's old value. Bits are numbered from the most
+  /// significant bit of byte 0.
+  Future<int> cacheSetBit(
+    String namespace,
+    String key,
+    int offset,
+    bool value, {
+    String? database,
+  }) async {
+    final response = await _cache(
+        'SetBit',
+        {
+          'namespace': namespace,
+          'key': key,
+          'offset': offset,
+          'value': value,
+        },
+        database);
+    return _json(response, 'SetBit')['previous'] as int;
+  }
+
+  /// Read one bit. Past the end of the value, and on a missing key, every
+  /// bit is 0.
+  Future<int> cacheGetBit(
+    String namespace,
+    String key,
+    int offset, {
+    String? database,
+  }) async {
+    final response = await _cache(
+        'GetBit',
+        {
+          'namespace': namespace,
+          'key': key,
+          'offset': offset,
+        },
+        database);
+    return _json(response, 'GetBit')['bit'] as int;
+  }
+
+  /// Count the set bits, optionally within a byte range `(start, end)`
+  /// with signed indices.
+  Future<int> cacheBitCount(
+    String namespace,
+    String key, {
+    (int, int)? range,
+    String? database,
+  }) async {
+    final response = await _cache(
+        'BitCount',
+        {
+          'namespace': namespace,
+          'key': key,
+          'range': range == null ? null : [range.$1, range.$2],
+        },
+        database);
+    return _json(response, 'BitCount')['count'] as int;
+  }
+
+  /// The position of the first bit equal to `bit`, optionally within a
+  /// byte range, or -1 when there is none.
+  Future<int> cacheBitPosition(
+    String namespace,
+    String key,
+    bool bit, {
+    (int, int)? range,
+    String? database,
+  }) async {
+    final response = await _cache(
+        'BitPos',
+        {
+          'namespace': namespace,
+          'key': key,
+          'bit': bit,
+          'range': range == null ? null : [range.$1, range.$2],
+        },
+        database);
+    return _json(response, 'BitPos')['position'] as int;
+  }
+
+  /// Combine several values bitwise and store the result at `dest`.
+  /// Returns the result's size in bytes.
+  Future<int> cacheBitOperation(
+    String namespace,
+    BitOperation op,
+    String dest,
+    List<String> keys, {
+    String? database,
+  }) async {
+    final response = await _cache(
+        'BitOp',
+        {
+          'namespace': namespace,
+          'op': op.wire,
+          'dest': dest,
+          'keys': keys,
+        },
+        database);
+    return _json(response, 'BitOp')['length'] as int;
+  }
+
+  /// Add elements to a HyperLogLog, creating it when absent. Returns
+  /// whether the estimate may have moved.
+  Future<bool> cacheHyperLogLogAdd(
+    String namespace,
+    String key,
+    List<Object> elements, {
+    String? database,
+  }) async {
+    final response = await _cache(
+        'PfAdd',
+        {
+          'namespace': namespace,
+          'key': key,
+          'elements': _byteList(elements, 'elements'),
+        },
+        database);
+    return _json(response, 'PfAdd')['changed'] == true;
+  }
+
+  /// Estimated number of distinct elements. With several keys, the
+  /// estimate is of their union.
+  Future<int> cacheHyperLogLogCount(
+    String namespace,
+    List<String> keys, {
+    String? database,
+  }) async {
+    final response = await _cache(
+        'PfCount',
+        {
+          'namespace': namespace,
+          'keys': keys,
+        },
+        database);
+    return _json(response, 'PfCount')['count'] as int;
+  }
+
+  /// Merge several HyperLogLogs into `dest`, which is included as a
+  /// source when it already exists.
+  Future<void> cacheHyperLogLogMerge(
+    String namespace,
+    String dest,
+    List<String> sources, {
+    String? database,
+  }) async {
+    await _cache(
+        'PfMerge',
+        {
+          'namespace': namespace,
+          'dest': dest,
+          'sources': sources,
+        },
+        database);
+  }
+
+  /// Atomically pop an element from one end of `source` and push it onto
+  /// one end of `destination`. Returns the element, or null when `source`
+  /// is empty.
+  Future<Uint8List?> cacheListMove(
+    String namespace,
+    String source,
+    String destination,
+    ListEnd from,
+    ListEnd to, {
+    String? database,
+  }) async {
+    final response = await _cache(
+        'LMove',
+        {
+          'namespace': namespace,
+          'source': source,
+          'destination': destination,
+          'from': from.wire,
+          'to': to.wire,
+        },
+        database);
+    return _cacheValue(response, 'LMove');
+  }
+
+  /// Set the absolute instant an existing live key dies. A deadline
+  /// already passed deletes the key. Answers `updated` and `deleted`.
+  Future<Map<String, dynamic>> cacheExpireAt(
+    String namespace,
+    String key,
+    DateTime at, {
+    String? database,
+  }) async {
+    final response = await _cache(
+        'ExpireAt',
+        {
+          'namespace': namespace,
+          'key': key,
+          'at_ms': at.millisecondsSinceEpoch,
+        },
+        database);
+    return _json(response, 'ExpireAt');
+  }
+
+  /// What this node's cache is doing: lookup hits and misses, the memory
+  /// budget and the eviction policy. Node-wide, not per database.
+  Future<Map<String, dynamic>> cacheStats({
+    String? database,
+  }) async {
+    final response = await request({'Cache': 'Stats'}, database: database);
+    return _json(response, 'Stats');
+  }
+
+  /// Delete every cache key in this database, across every namespace.
+  /// Returns how many keys were removed.
+  Future<int> cacheFlushDatabase({
+    String? database,
+  }) async {
+    final response =
+        await request({'Cache': 'FlushDatabase'}, database: database);
+    return _json(response, 'FlushDatabase')['cleared'] as int;
+  }
+
+  /// Concatenate bytes onto what a key already holds, and return the new
+  /// length. A missing key is created; an existing key keeps its expiry.
+  Future<int> cacheAppend(
+    String namespace,
+    String key,
+    Object value, {
+    String? database,
+  }) async {
+    final response = await _cache(
+        'Append',
+        {
+          'namespace': namespace,
+          'key': key,
+          'value': _bytes(value, 'value'),
+        },
+        database);
+    return _json(response, 'Append')['length'] as int;
+  }
+
+  /// Write only if the key still holds `expected` (null: the key must be
+  /// absent). A null `value` deletes the key. Answers `swapped`; on a
+  /// mismatch, `current` holds the value present when it is valid UTF-8,
+  /// and `currentIsBinary` is true when it is not.
+  Future<Map<String, dynamic>> cacheCompareAndSwap(
+    String namespace,
+    String key,
+    Object? expected,
+    Object? value, {
+    Duration? ttl,
+    String? database,
+  }) async {
+    final response = await _cache(
+        'CompareAndSwap',
+        {
+          'namespace': namespace,
+          'key': key,
+          'expected': expected == null ? null : _bytes(expected, 'expected'),
+          'value': value == null ? null : _bytes(value, 'value'),
+          'ttl_ms': ttl?.inMilliseconds,
+        },
+        database);
+    return _json(response, 'CompareAndSwap');
+  }
+
+  /// Read a key and delete it in one atomic step. Null when the key was
+  /// absent or expired.
+  Future<Uint8List?> cacheGetAndDelete(
+    String namespace,
+    String key, {
+    String? database,
+  }) async {
+    final response = await _cache(
+        'GetDel',
+        {
+          'namespace': namespace,
+          'key': key,
+        },
+        database);
+    return _cacheValue(response, 'GetDel');
+  }
+
+  /// Write a value and return the one it replaced, atomically. Any TTL on
+  /// the old value is dropped.
+  Future<Uint8List?> cacheGetAndSet(
+    String namespace,
+    String key,
+    Object value, {
+    Duration? ttl,
+    String? database,
+  }) async {
+    final response = await _cache(
+        'GetSet',
+        {
+          'namespace': namespace,
+          'key': key,
+          'value': _bytes(value, 'value'),
+          'ttl_ms': ttl?.inMilliseconds,
+        },
+        database);
+    return _cacheValue(response, 'GetSet');
+  }
+
+  /// Read a key and change its expiry in the same atomic step. The value
+  /// itself is never modified.
+  Future<Uint8List?> cacheGetAndExpire(
+    String namespace,
+    String key,
+    CacheExpiry expiry, {
+    String? database,
+  }) async {
+    final response = await _cache(
+        'GetEx',
+        {
+          'namespace': namespace,
+          'key': key,
+          'expiry': expiry.toJson(),
+        },
+        database);
+    return _cacheValue(response, 'GetEx');
+  }
+
+  /// Keep only the inclusive index range of a list, dropping everything
+  /// outside it. Answers `length` and `removed`.
+  Future<Map<String, dynamic>> cacheListTrim(
+    String namespace,
+    String key,
+    int start,
+    int stop, {
+    String? database,
+  }) async {
+    final response = await _cache(
+        'LTrim',
+        {
+          'namespace': namespace,
+          'key': key,
+          'start': start,
+          'stop': stop,
+        },
+        database);
+    return _json(response, 'LTrim');
+  }
+
+  /// Every member of every named set, without duplicates. A missing key
+  /// is the empty set.
+  Future<List<Uint8List>> cacheSetUnion(
+    String namespace,
+    List<String> keys, {
+    String? database,
+  }) async {
+    final response = await _cache(
+        'SUnion',
+        {
+          'namespace': namespace,
+          'keys': keys,
+        },
+        database);
+    return _byteLists(_json(response, 'SUnion')['members']);
+  }
+
+  /// The members present in every named set.
+  Future<List<Uint8List>> cacheSetIntersection(
+    String namespace,
+    List<String> keys, {
+    String? database,
+  }) async {
+    final response = await _cache(
+        'SInter',
+        {
+          'namespace': namespace,
+          'keys': keys,
+        },
+        database);
+    return _byteLists(_json(response, 'SInter')['members']);
+  }
+
+  /// The members of the first set that are in none of the rest.
+  Future<List<Uint8List>> cacheSetDifference(
+    String namespace,
+    List<String> keys, {
+    String? database,
+  }) async {
+    final response = await _cache(
+        'SDiff',
+        {
+          'namespace': namespace,
+          'keys': keys,
+        },
+        database);
+    return _byteLists(_json(response, 'SDiff')['members']);
+  }
+
+  /// Random members of a set, without removing them. No count: at most
+  /// one. A positive count: up to that many distinct members. A negative
+  /// count: exactly that many, repeats allowed.
+  Future<List<Uint8List>> cacheSetRandomMembers(
+    String namespace,
+    String key, {
+    int? count,
+    String? database,
+  }) async {
+    final response = await _cache(
+        'SRandMember',
+        {
+          'namespace': namespace,
+          'key': key,
+          'count': count,
+        },
+        database);
+    return _byteLists(_json(response, 'SRandMember')['members']);
+  }
+
+  /// Add to one hash field, atomically, returning its new value. A
+  /// missing field starts at zero.
+  Future<int> cacheHashIncrement(
+    String namespace,
+    String key,
+    Object field,
+    int by, {
+    String? database,
+  }) async {
+    final response = await _cache(
+        'HIncrBy',
+        {
+          'namespace': namespace,
+          'key': key,
+          'field': _bytes(field, 'field'),
+          'by': by,
+        },
+        database);
+    return _json(response, 'HIncrBy')['value'] as int;
+  }
+
+  /// Run cache operations in order in one round trip, each exactly as if
+  /// it had been sent alone. A failing operation does not stop the rest.
+  Future<List<CacheOpResult>> cachePipeline(
+    List<Object> ops, {
+    String? database,
+  }) async {
+    final response = await _cache(
+        'Pipeline',
+        {
+          'ops': ops,
+        },
+        database);
+    return _opResults(_json(response, 'Pipeline'));
+  }
+
+  /// Run cache operations in order holding the cache write lock, so no
+  /// other writer interleaves with them. Every operation's inputs are
+  /// checked before any runs; after that there is no rollback.
+  Future<List<CacheOpResult>> cacheTransaction(
+    List<Object> ops, {
+    String? database,
+  }) async {
+    final response = await _cache(
+        'Transaction',
+        {
+          'ops': ops,
+        },
+        database);
+    return _opResults(_json(response, 'Transaction'));
+  }
+
+  /// Store a script: operations run as one transaction, where any string
+  /// (or value) written `$1`, `$2`, ... is replaced by that argument at
+  /// run time. Loading the same name again replaces it.
+  Future<void> cacheScriptLoad(
+    String name,
+    List<Object> ops, {
+    String? database,
+  }) async {
+    await _cache(
+        'ScriptLoad',
+        {
+          'name': name,
+          'ops': ops,
+        },
+        database);
+  }
+
+  /// Run a stored script with these arguments as one transaction.
+  Future<List<CacheOpResult>> cacheScriptRun(
+    String name, {
+    List<String> args = const [],
+    String? database,
+  }) async {
+    final response = await _cache(
+        'ScriptRun',
+        {
+          'name': name,
+          'args': args,
+        },
+        database);
+    return _opResults(_json(response, 'ScriptRun'));
+  }
+
+  /// The most frequently addressed keys on this node since it started,
+  /// with estimated counts. The server must be configured with `[cache]
+  /// hot_keys` above zero; otherwise it refuses.
+  Future<Map<String, dynamic>> cacheHotKeys({
+    int? limit,
+    String? database,
+  }) async {
+    final response = await _cache(
+        'HotKeys',
+        {
+          'limit': limit,
+        },
+        database);
+    return _json(response, 'HotKeys');
+  }
+
+  /// Delete every expired cache key in this database now, rather than
+  /// leaving it to compaction. Returns how many went.
+  Future<int> cachePurgeExpired({
+    String? database,
+  }) async {
+    final response =
+        await request({'Cache': 'PurgeExpired'}, database: database);
+    return _json(response, 'PurgeExpired')['purged'] as int;
+  }
+
+  /// Pop the head of the first non-empty list among `keys`, waiting up to
+  /// the timeout for one to receive an element. Null when the wait ran
+  /// out.
+  Future<MapEntry<String, Uint8List>?> cacheBlockingLeftPop(
+    String namespace,
+    List<String> keys,
+    Duration timeout, {
+    String? database,
+  }) async {
+    final response = await _cache(
+        'BLPop',
+        {
+          'namespace': namespace,
+          'keys': keys,
+          'timeout_ms': timeout.inMilliseconds,
+        },
+        database);
+    return _popped(response, 'BLPop');
+  }
+
+  /// Pop the tail of the first non-empty list among `keys`, waiting up to
+  /// the timeout for one to receive an element. Null when the wait ran
+  /// out.
+  Future<MapEntry<String, Uint8List>?> cacheBlockingRightPop(
+    String namespace,
+    List<String> keys,
+    Duration timeout, {
+    String? database,
+  }) async {
+    final response = await _cache(
+        'BRPop',
+        {
+          'namespace': namespace,
+          'keys': keys,
+          'timeout_ms': timeout.inMilliseconds,
+        },
+        database);
+    return _popped(response, 'BRPop');
+  }
+
+  /// Cap a namespace at `maxKeys` live keys and `maxBytes` of values. A
+  /// write that would pass either is refused. Both absent removes the
+  /// limit.
+  Future<Map<String, dynamic>> cacheSetNamespaceLimit(
+    String namespace, {
+    int? maxKeys,
+    int? maxBytes,
+    String? database,
+  }) async {
+    final response = await _cache(
+        'SetNamespaceLimit',
+        {
+          'namespace': namespace,
+          'max_keys': maxKeys,
+          'max_bytes': maxBytes,
+        },
+        database);
+    return _json(response, 'SetNamespaceLimit');
+  }
+
+  /// A namespace's limit and what it holds now: `max_keys`, `max_bytes`,
+  /// `keys` and `bytes`.
+  Future<Map<String, dynamic>> cacheGetNamespaceLimit(
+    String namespace, {
+    String? database,
+  }) async {
+    final response = await _cache(
+        'GetNamespaceLimit',
+        {
+          'namespace': namespace,
+        },
+        database);
+    return _json(response, 'GetNamespaceLimit');
+  }
+
+  /// Append a message to a channel, returning the id it was given.
+  Future<int> cachePublish(
+    String channel,
+    String message, {
+    String? database,
+  }) async {
+    final response = await _cache(
+        'Publish',
+        {
+          'channel': channel,
+          'message': message,
+        },
+        database);
+    return _json(response, 'Publish')['id'] as int;
+  }
+
+  /// The messages after id `after` on these channels (a trailing `*` is a
+  /// pattern). Answers `messages` and `next`, the id to pass as `after`
+  /// next time.
+  Future<Map<String, dynamic>> cachePoll(
+    List<String> channels, {
+    int after = 0,
+    int limit = 100,
+    String? database,
+  }) async {
+    final response = await _cache(
+        'Poll',
+        {
+          'channels': channels,
+          'after': after,
+          'limit': limit,
+        },
+        database);
+    return _json(response, 'Poll');
+  }
+
   // ---- documents -----------------------------------------------------------
 
   /// Create a collection.
@@ -1162,12 +2175,14 @@ class TriCore {
     Map<String, Object?> document, {
     String? id,
     String? database,
+    String? txn,
   }) async {
     final json = _json(
       await _document(
         'Insert',
         {'collection': collection, 'id': id, 'document': document},
         database,
+        txn,
       ),
       'Insert',
     );
@@ -1179,9 +2194,15 @@ class TriCore {
     String collection,
     String id, {
     String? database,
+    String? txn,
   }) async {
     final documents = _documents(
-      await _document('Get', {'collection': collection, 'id': id}, database),
+      await _document(
+        'Get',
+        {'collection': collection, 'id': id},
+        database,
+        txn,
+      ),
       'Get',
     );
     return documents.isEmpty ? null : documents.first;
@@ -1193,12 +2214,14 @@ class TriCore {
     Object filter = Filter.all,
     int? limit,
     String? database,
+    String? txn,
   }) async {
     return _documents(
       await _document(
         'Find',
         {'collection': collection, 'filter': filter, 'limit': limit},
         database,
+        txn,
       ),
       'Find',
     );
@@ -1210,11 +2233,13 @@ class TriCore {
     String id,
     Map<String, Object?> fields, {
     String? database,
+    String? txn,
   }) async {
     await _document(
       'Update',
       {'collection': collection, 'id': id, 'set': fields},
       database,
+      txn,
     );
   }
 
@@ -1227,6 +2252,7 @@ class TriCore {
     Map<String, Object?>? increment,
     bool upsert = false,
     String? database,
+    String? txn,
   }) async {
     return _json(
       await _document(
@@ -1238,6 +2264,7 @@ class TriCore {
           'upsert': upsert,
         },
         database,
+        txn,
       ),
       'UpdateOne',
     );
@@ -1250,6 +2277,7 @@ class TriCore {
     Map<String, Object?>? set,
     Map<String, Object?>? increment,
     String? database,
+    String? txn,
   }) =>
       documentUpdateOne(
         collection,
@@ -1258,6 +2286,7 @@ class TriCore {
         increment: increment,
         upsert: true,
         database: database,
+        txn: txn,
       );
 
   /// Update every document a filter matches.
@@ -1267,6 +2296,7 @@ class TriCore {
     Map<String, Object?>? set,
     Map<String, Object?>? increment,
     String? database,
+    String? txn,
   }) async {
     return _json(
       await _document(
@@ -1277,6 +2307,7 @@ class TriCore {
           'update': _updateBody(set, increment),
         },
         database,
+        txn,
       ),
       'UpdateMany',
     );
@@ -1287,11 +2318,13 @@ class TriCore {
     String collection,
     String id, {
     String? database,
+    String? txn,
   }) async {
     await _document(
       'Delete',
       {'collection': collection, 'id': id},
       database,
+      txn,
     );
   }
 
@@ -1359,15 +2392,246 @@ class TriCore {
     String collection,
     List<Map<String, Object?>> pipeline, {
     String? database,
+    String? txn,
   }) async {
     return _documents(
       await _document(
         'Aggregate',
         {'collection': collection, 'pipeline': pipeline},
         database,
+        txn,
       ),
       'Aggregate',
     );
+  }
+
+  /// Swap a document's whole body for a new one: afterwards the stored
+  /// body is exactly `document`, plus `_id`. With `upsert`, a missing
+  /// document is created rather than refused. Answers `id`, `replaced`,
+  /// `inserted` and, when asked for, `document`.
+  Future<Map<String, dynamic>> documentReplace(
+    String collection,
+    String id,
+    Map<String, Object?> document, {
+    bool upsert = false,
+    ReturnDocument returnDocument = ReturnDocument.none,
+    int? expectedVersion,
+    String? txn,
+    String? database,
+  }) async {
+    final response = await _document(
+        'Replace',
+        {
+          'collection': collection,
+          'id': id,
+          'document': document,
+          'upsert': upsert,
+          'return': returnDocument.wire,
+          'expected_version': expectedVersion,
+        },
+        database,
+        txn);
+    return _json(response, 'Replace');
+  }
+
+  /// Insert several documents as one atomic batch: either every document
+  /// lands or none does. Each document's id is its own `_id` when it
+  /// carries one, and is generated otherwise. Returns the ids, in order.
+  Future<List<String>> documentInsertMany(
+    String collection,
+    List<Map<String, Object?>> documents, {
+    String? txn,
+    String? database,
+  }) async {
+    final response = await _document(
+        'InsertMany',
+        {
+          'collection': collection,
+          'documents': documents,
+        },
+        database,
+        txn);
+    return _strings(_json(response, 'InsertMany')['ids']);
+  }
+
+  /// Delete every document a filter matches, returning how many went.
+  Future<int> documentDeleteMany(
+    String collection,
+    Object filter, {
+    String? txn,
+    String? database,
+  }) async {
+    final response = await _document(
+        'DeleteMany',
+        {
+          'collection': collection,
+          'filter': filter,
+        },
+        database,
+        txn);
+    return _json(response, 'DeleteMany')['deleted'] as int;
+  }
+
+  /// Move a collection, with its documents and indexes, to a new name.
+  /// Refused when the new name already exists.
+  Future<void> documentRenameCollection(
+    String collection,
+    String to, {
+    String? database,
+  }) async {
+    await _document(
+        'RenameCollection',
+        {
+          'collection': collection,
+          'to': to,
+        },
+        database);
+  }
+
+  /// Delete the documents a TTL index says have expired, now. Returns how
+  /// many went.
+  Future<int> documentPurgeExpired(
+    String collection, {
+    String? database,
+  }) async {
+    final response = await _document(
+        'PurgeExpired',
+        {
+          'collection': collection,
+        },
+        database);
+    return _json(response, 'PurgeExpired')['purged'] as int;
+  }
+
+  /// Run a find and describe how it ran instead of returning its
+  /// documents: the plan, the index, why it scanned, the estimate,
+  /// records examined and returned, and the time taken.
+  Future<Map<String, dynamic>> documentExplain(
+    String collection, {
+    Object filter = Filter.all,
+    int? limit,
+    List<Map<String, Object?>> sort = const [],
+    int? skip,
+    String? database,
+  }) async {
+    final response = await _document(
+        'Explain',
+        {
+          'collection': collection,
+          'filter': filter,
+          'limit': limit,
+          'sort': sort,
+          'skip': skip,
+        },
+        database);
+    return _json(response, 'Explain');
+  }
+
+  /// Open a document transaction spanning requests, returning its id.
+  /// Each later call given that id as `txn` reads and writes inside it,
+  /// seeing its own writes and nobody else's since it began. Snapshot
+  /// isolation, or serializable.
+  Future<String> documentBeginTransaction({
+    bool serializable = false,
+    String? database,
+  }) async {
+    final response = await _document(
+        'BeginTransaction',
+        {
+          'serializable': serializable,
+        },
+        database);
+    return _json(response, 'BeginTransaction')['txn'] as String;
+  }
+
+  /// Commit a document transaction: every write lands as one atomic
+  /// batch, or a conflict is returned and nothing lands.
+  Future<Map<String, dynamic>> documentCommitTransaction(
+    String txn, {
+    String? database,
+  }) async {
+    final response = await request({'Document': 'CommitTransaction'},
+        database: database, txn: txn);
+    return _json(response, 'CommitTransaction');
+  }
+
+  /// Discard a document transaction.
+  Future<void> documentRollbackTransaction(
+    String txn, {
+    String? database,
+  }) async {
+    await request({'Document': 'RollbackTransaction'},
+        database: database, txn: txn);
+  }
+
+  /// Rebuild one index from the stored documents. Answers `rebuilt`,
+  /// `documents` and `entries`.
+  Future<Map<String, dynamic>> documentRebuildIndex(
+    String collection,
+    String indexName, {
+    String? database,
+  }) async {
+    final response = await _document(
+        'RebuildIndex',
+        {
+          'collection': collection,
+          'index_name': indexName,
+        },
+        database);
+    return _json(response, 'RebuildIndex');
+  }
+
+  /// Set a collection's options (`schema`, `defaults`, `versioned`),
+  /// replacing any it had. Refused when an existing document would break
+  /// the new schema.
+  Future<Map<String, dynamic>> documentSetCollectionOptions(
+    String collection,
+    Map<String, Object?> options, {
+    String? database,
+  }) async {
+    final response = await _document(
+        'SetCollectionOptions',
+        {
+          'collection': collection,
+          'options': options,
+        },
+        database);
+    return _json(response, 'SetCollectionOptions');
+  }
+
+  /// A collection's options.
+  Future<Map<String, dynamic>> documentGetCollectionOptions(
+    String collection, {
+    String? database,
+  }) async {
+    final response = await _document(
+        'GetCollectionOptions',
+        {
+          'collection': collection,
+        },
+        database);
+    return _map(_json(response, 'GetCollectionOptions')['options']);
+  }
+
+  /// Many inserts, updates, replaces and deletes on one collection,
+  /// applied in order as one atomic batch: every operation lands or none
+  /// does. Answers `inserted`, `inserted_ids`, `updated`, `upserted`,
+  /// `replaced` and `deleted`.
+  Future<Map<String, dynamic>> documentBulkWrite(
+    String collection,
+    List<Map<String, Object?>> ops, {
+    String? txn,
+    String? database,
+  }) async {
+    final response = await _document(
+        'BulkWrite',
+        {
+          'collection': collection,
+          'ops': ops,
+        },
+        database,
+        txn);
+    return _json(response, 'BulkWrite');
   }
 
   // ---- vectors -------------------------------------------------------------
@@ -1530,6 +2794,405 @@ class TriCore {
       ),
       'ListVectors',
     );
+  }
+
+  /// Embed texts with the server's built-in embedder (deterministic
+  /// feature hashing: lexical, no model). Nothing is stored. Answers
+  /// `vectors`, `sparse`, `embedder` and `dimension`.
+  Future<Map<String, dynamic>> vectorEmbed(
+    List<String> texts,
+    int dimension, {
+    String? database,
+  }) async {
+    final response = await _vector(
+        'Embed',
+        {
+          'texts': texts,
+          'dimension': dimension,
+        },
+        database);
+    return _json(response, 'Embed');
+  }
+
+  /// Embed each text at the collection's dimension and upsert the vectors
+  /// as one atomic batch. Items are `{id, text, metadata}`; the text is
+  /// kept in the metadata under `text`. Returns how many were written.
+  Future<int> vectorUpsertText(
+    String collection,
+    List<Map<String, Object?>> items, {
+    String? database,
+  }) async {
+    final response = await _vector(
+        'UpsertText',
+        {
+          'collection': collection,
+          'items': items,
+        },
+        database);
+    return _json(response, 'UpsertText')['upserted'] as int;
+  }
+
+  /// Point an alias at a collection; a null collection removes it. Every
+  /// operation naming the alias acts on the collection.
+  Future<void> vectorSetAlias(
+    String alias, {
+    String? collection,
+    String? database,
+  }) async {
+    await _vector(
+        'SetAlias',
+        {
+          'alias': alias,
+          'collection': collection,
+        },
+        database);
+  }
+
+  /// Every alias and the collection it names, as `{alias, collection}`.
+  Future<List<Map<String, dynamic>>> vectorListAliases({
+    String? database,
+  }) async {
+    final response =
+        await request({'Vector': 'ListAliases'}, database: database);
+    return _maps(_json(response, 'ListAliases')['aliases']);
+  }
+
+  /// Declare a named vector on a collection: a second vector per item,
+  /// with its own dimension and metric.
+  Future<void> vectorAddNamedVector(
+    String collection,
+    String name,
+    int dimension, {
+    VectorMetric metric = VectorMetric.cosine,
+    String? database,
+  }) async {
+    await _vector(
+        'AddNamedVector',
+        {
+          'collection': collection,
+          'name': name,
+          'dimension': dimension,
+          'metric': metric.wire,
+        },
+        database);
+  }
+
+  /// Write an item's vectors by name (`default` is the collection's own),
+  /// each with the same metadata.
+  Future<void> vectorUpsertNamed(
+    String collection,
+    String id,
+    Map<String, List<double>> vectors, {
+    Map<String, Object?>? metadata,
+    String? database,
+  }) async {
+    await _vector(
+        'UpsertNamed',
+        {
+          'collection': collection,
+          'id': id,
+          'vectors': vectors,
+          'metadata': metadata,
+        },
+        database);
+  }
+
+  /// Write many vectors as one atomic batch. Items are `{id, vector,
+  /// metadata}`. Every item is validated before any is written, and a
+  /// repeated id is refused. Returns how many were written.
+  Future<int> vectorUpsertMany(
+    String collection,
+    List<Map<String, Object?>> items, {
+    String? database,
+  }) async {
+    final response = await _vector(
+        'UpsertMany',
+        {
+          'collection': collection,
+          'items': items,
+        },
+        database);
+    return _json(response, 'UpsertMany')['upserted'] as int;
+  }
+
+  /// Delete many vectors by id as one atomic batch, returning how many of
+  /// the ids were present.
+  Future<int> vectorDeleteMany(
+    String collection,
+    List<String> ids, {
+    String? database,
+  }) async {
+    final response = await _vector(
+        'DeleteMany',
+        {
+          'collection': collection,
+          'ids': ids,
+        },
+        database);
+    return _json(response, 'DeleteMany')['deleted'] as int;
+  }
+
+  /// Run several query vectors against one collection in one request. One
+  /// result list per query, in the order asked, each what a single search
+  /// with the same arguments returns.
+  Future<List<List<VectorHit>>> vectorSearchBatch(
+    String collection,
+    List<List<double>> vectors,
+    int topK, {
+    Map<String, Object?>? filter,
+    double? minScore,
+    bool includeVectors = false,
+    VectorSearchOptions? options,
+    String? database,
+  }) async {
+    final response = await _vector(
+        'SearchBatch',
+        {
+          'collection': collection,
+          'vectors': [for (final vector in vectors) _numbers(vector)],
+          'top_k': topK,
+          'filter': filter,
+          'min_score': minScore,
+          'include_vectors': includeVectors,
+          ...?options?.toJson(),
+        },
+        database);
+    return _hitLists(_json(response, 'SearchBatch')['results']);
+  }
+
+  /// Delete every vector whose metadata matches a filter, as one atomic
+  /// batch. An empty filter is refused.
+  Future<int> vectorDeleteByFilter(
+    String collection,
+    Map<String, Object?> filter, {
+    String? database,
+  }) async {
+    final response = await _vector(
+        'DeleteByFilter',
+        {
+          'collection': collection,
+          'filter': filter,
+        },
+        database);
+    return _json(response, 'DeleteByFilter')['deleted'] as int;
+  }
+
+  /// Merge `set` into the metadata of every vector matching a filter, as
+  /// one atomic batch. Vectors are never touched.
+  Future<int> vectorUpdateByFilter(
+    String collection,
+    Map<String, Object?> filter,
+    Map<String, Object?> set, {
+    String? database,
+  }) async {
+    final response = await _vector(
+        'UpdateByFilter',
+        {
+          'collection': collection,
+          'filter': filter,
+          'set': set,
+        },
+        database);
+    return _json(response, 'UpdateByFilter')['updated'] as int;
+  }
+
+  /// How many vectors a collection holds, or, with a filter, how many
+  /// match it. An exact count.
+  Future<int> vectorCount(
+    String collection, {
+    Map<String, Object?>? filter,
+    String? database,
+  }) async {
+    final response = await _vector(
+        'Count',
+        {
+          'collection': collection,
+          'filter': filter,
+        },
+        database);
+    return _json(response, 'Count')['count'] as int;
+  }
+
+  /// The partitions of a collection: each distinct value of `field`
+  /// (`_namespace` or `_tenant`) with its vector count, under
+  /// `partitions`, plus `unpartitioned`.
+  Future<Map<String, dynamic>> vectorListPartitions(
+    String collection, {
+    String field = '_namespace',
+    String? database,
+  }) async {
+    final response = await _vector(
+        'ListPartitions',
+        {
+          'collection': collection,
+          'field': field,
+        },
+        database);
+    return _json(response, 'ListPartitions');
+  }
+
+  /// Rename a collection, moving its catalog record and every vector with
+  /// it. Refused when the new name already exists.
+  Future<void> vectorRenameCollection(
+    String collection,
+    String to, {
+    String? database,
+  }) async {
+    await _vector(
+        'RenameCollection',
+        {
+          'collection': collection,
+          'to': to,
+        },
+        database);
+  }
+
+  /// Rebuild the collection's ANN index from its stored vectors and
+  /// persist it, clearing every tombstone.
+  Future<Map<String, dynamic>> vectorRebuildIndex(
+    String collection, {
+    String? database,
+  }) async {
+    final response = await _vector(
+        'RebuildIndex',
+        {
+          'collection': collection,
+        },
+        database);
+    return _json(response, 'RebuildIndex');
+  }
+
+  /// The shape of the collection's ANN index: layers, degrees,
+  /// tombstones, reachability and memory.
+  Future<Map<String, dynamic>> vectorIndexStats(
+    String collection, {
+    String? database,
+  }) async {
+    final response = await _vector(
+        'IndexStats',
+        {
+          'collection': collection,
+        },
+        database);
+    return _json(response, 'IndexStats');
+  }
+
+  /// Measure the ANN index's recall: sampled stored vectors are each
+  /// searched through the index and by an exact scan, and the overlap is
+  /// reported under `recall`.
+  Future<Map<String, dynamic>> vectorMeasureRecall(
+    String collection, {
+    int? sample,
+    int? topK,
+    int? efSearch,
+    String? database,
+  }) async {
+    final response = await _vector(
+        'MeasureRecall',
+        {
+          'collection': collection,
+          'sample': sample,
+          'top_k': topK,
+          'ef_search': efSearch,
+        },
+        database);
+    return _json(response, 'MeasureRecall');
+  }
+
+  /// Search with several query vectors and return one fused ranking.
+  Future<List<VectorHit>> vectorSearchMulti(
+    String collection,
+    List<List<double>> vectors,
+    int topK, {
+    FusionMethod fusion = FusionMethod.rrf,
+    Map<String, Object?>? filter,
+    String? database,
+  }) async {
+    final response = await _vector(
+        'SearchMulti',
+        {
+          'collection': collection,
+          'vectors': [for (final vector in vectors) _numbers(vector)],
+          'top_k': topK,
+          'fusion': fusion.wire,
+          'filter': filter,
+        },
+        database);
+    return _hits(_json(response, 'SearchMulti')['results']);
+  }
+
+  /// Change a collection's configuration, returning it. `normalize` can
+  /// only change on an empty collection; `m` and `efConstruction` shape
+  /// the HNSW graph; `multiTenant` requires every vector to carry a
+  /// `_tenant`.
+  Future<Map<String, dynamic>> vectorSetCollectionConfig(
+    String collection, {
+    bool? normalize,
+    int? m,
+    int? efConstruction,
+    bool? multiTenant,
+    String? database,
+  }) async {
+    final response = await _vector(
+        'SetCollectionConfig',
+        {
+          'collection': collection,
+          'normalize': normalize,
+          'm': m,
+          'ef_construction': efConstruction,
+          'multi_tenant': multiTenant,
+        },
+        database);
+    return _json(response, 'SetCollectionConfig');
+  }
+
+  /// Copy a collection (configuration and every vector) to a new name.
+  /// Refused when the new name exists.
+  Future<void> vectorCopyCollection(
+    String collection,
+    String to, {
+    String? database,
+  }) async {
+    await _vector(
+        'CopyCollection',
+        {
+          'collection': collection,
+          'to': to,
+        },
+        database);
+  }
+
+  /// Search with a query built from examples: the sum of the positive
+  /// examples minus the sum of the negative ones. An example is a stored
+  /// vector's id or a vector given inline. Examples named by id are left
+  /// out of the results unless `excludeExamples` is false.
+  Future<List<VectorHit>> vectorSearchByExamples(
+    String collection,
+    int topK, {
+    List<Object> positive = const [],
+    List<Object> negative = const [],
+    Map<String, Object?>? filter,
+    double? minScore,
+    bool includeVectors = false,
+    bool excludeExamples = true,
+    VectorSearchOptions? options,
+    String? database,
+  }) async {
+    final response = await _vector(
+        'SearchByExamples',
+        {
+          'collection': collection,
+          'top_k': topK,
+          'positive': positive,
+          'negative': negative,
+          'filter': filter,
+          'min_score': minScore,
+          'include_vectors': includeVectors,
+          'exclude_examples': excludeExamples,
+          ...?options?.toJson(),
+        },
+        database);
+    return _hits(_json(response, 'SearchByExamples')['results']);
   }
 
   // ---- graphs --------------------------------------------------------------
@@ -1828,6 +3491,609 @@ class TriCore {
     );
   }
 
+  /// Write many nodes and edges as one unit: every record lands or none
+  /// does. Nodes are `{id, labels, properties}` and edges `{id, from, to,
+  /// label, properties}`; an edge may join nodes created in the same
+  /// batch. Answers `nodes` and `edges`.
+  Future<Map<String, dynamic>> graphAddMany(
+    String graph, {
+    List<Map<String, Object?>> nodes = const [],
+    List<Map<String, Object?>> edges = const [],
+    String? database,
+  }) async {
+    final response = await _graph(
+        'AddMany',
+        {
+          'graph': graph,
+          'nodes': nodes,
+          'edges': edges,
+        },
+        database);
+    return _json(response, 'AddMany');
+  }
+
+  /// Delete many nodes and edges as one unit. An id that is not there is
+  /// skipped. With `detach`, every edge touching a removed node goes too.
+  /// Answers `nodes_removed` and `edges_removed`.
+  Future<Map<String, dynamic>> graphRemoveMany(
+    String graph, {
+    List<String> nodes = const [],
+    List<String> edges = const [],
+    bool detach = false,
+    String? database,
+  }) async {
+    final response = await _graph(
+        'RemoveMany',
+        {
+          'graph': graph,
+          'nodes': nodes,
+          'edges': edges,
+          'detach': detach,
+        },
+        database);
+    return _json(response, 'RemoveMany');
+  }
+
+  /// Change an existing node in place, returning it. `properties` is a
+  /// JSON merge patch: a key set to a value is set, a key set to null is
+  /// removed. `removeLabels` applies before `addLabels`.
+  Future<Map<String, dynamic>> graphUpdateNode(
+    String graph,
+    String id, {
+    Map<String, Object?> properties = const {},
+    List<String> addLabels = const [],
+    List<String> removeLabels = const [],
+    String? database,
+  }) async {
+    final response = await _graph(
+        'UpdateNode',
+        {
+          'graph': graph,
+          'id': id,
+          'properties': properties,
+          'add_labels': addLabels,
+          'remove_labels': removeLabels,
+        },
+        database);
+    return _json(response, 'UpdateNode');
+  }
+
+  /// Change an existing edge in place, returning it. `properties` merges
+  /// as for a node, and `label`, when given, changes the edge's type. The
+  /// endpoints cannot change.
+  Future<Map<String, dynamic>> graphUpdateEdge(
+    String graph,
+    String id, {
+    Map<String, Object?> properties = const {},
+    String? label,
+    String? database,
+  }) async {
+    final response = await _graph(
+        'UpdateEdge',
+        {
+          'graph': graph,
+          'id': id,
+          'properties': properties,
+          'label': label,
+        },
+        database);
+    return _json(response, 'UpdateEdge');
+  }
+
+  /// Copy a graph (nodes, edges and schema) to a new name. Refused when
+  /// the new name exists. Answers `nodes` and `edges`.
+  Future<Map<String, dynamic>> graphCopy(
+    String graph,
+    String to, {
+    String? database,
+  }) async {
+    final response = await _graph(
+        'CopyGraph',
+        {
+          'graph': graph,
+          'to': to,
+        },
+        database);
+    return _json(response, 'CopyGraph');
+  }
+
+  /// A bounded depth-first walk from a node: the nodes within `maxDepth`
+  /// hops (default 3, at most 10), in DFS preorder, each with the
+  /// shortest `depth` found.
+  Future<Map<String, dynamic>> graphDfs(
+    String graph,
+    String start, {
+    GraphDirection direction = GraphDirection.outgoing,
+    String? label,
+    int? maxDepth,
+    int? limit,
+    String? database,
+  }) async {
+    final response = await _graph(
+        'Dfs',
+        {
+          'graph': graph,
+          'start': start,
+          'direction': direction.wire,
+          'label': label,
+          'max_depth': maxDepth,
+          'limit': limit,
+        },
+        database);
+    return _json(response, 'Dfs');
+  }
+
+  /// Partition the graph's nodes into connected components, largest
+  /// first. `weak` ignores edge direction; `strong` groups nodes that can
+  /// each reach the other.
+  Future<Map<String, dynamic>> graphConnectedComponents(
+    String graph, {
+    ComponentKind kind = ComponentKind.weak,
+    String? label,
+    int? limit,
+    String? database,
+  }) async {
+    final response = await _graph(
+        'ConnectedComponents',
+        {
+          'graph': graph,
+          'kind': kind.wire,
+          'label': label,
+          'limit': limit,
+        },
+        database);
+    return _json(response, 'ConnectedComponents');
+  }
+
+  /// Whether the graph contains a cycle (`hasCycle`), and one `cycle` as
+  /// evidence.
+  Future<Map<String, dynamic>> graphDetectCycle(
+    String graph, {
+    bool directed = true,
+    String? label,
+    String? database,
+  }) async {
+    final response = await _graph(
+        'DetectCycle',
+        {
+          'graph': graph,
+          'directed': directed,
+          'label': label,
+        },
+        database);
+    return _json(response, 'DetectCycle');
+  }
+
+  /// Counts describing a graph: nodes and edges, per node label and per
+  /// edge type, self-loops, isolated nodes, degree extremes, and edges
+  /// whose endpoint no longer exists.
+  Future<Map<String, dynamic>> graphStats(
+    String graph, {
+    String? database,
+  }) async {
+    final response = await _graph(
+        'GraphStats',
+        {
+          'graph': graph,
+        },
+        database);
+    return _json(response, 'GraphStats');
+  }
+
+  /// The part of the graph within `maxDepth` hops of the seeds: the nodes
+  /// reached and every edge joining two of them.
+  Future<Map<String, dynamic>> graphSubgraph(
+    String graph,
+    List<String> seeds, {
+    GraphDirection direction = GraphDirection.both,
+    String? label,
+    int? maxDepth,
+    int? limit,
+    String? database,
+  }) async {
+    final response = await _graph(
+        'Subgraph',
+        {
+          'graph': graph,
+          'seeds': seeds,
+          'direction': direction.wire,
+          'label': label,
+          'max_depth': maxDepth,
+          'limit': limit,
+        },
+        database);
+    return _json(response, 'Subgraph');
+  }
+
+  /// What the graph's data looks like: its node labels and edge types,
+  /// each with a count and the property keys seen on it.
+  Future<Map<String, dynamic>> graphSchema(
+    String graph, {
+    String? database,
+  }) async {
+    final response = await _graph(
+        'GraphSchema',
+        {
+          'graph': graph,
+        },
+        database);
+    return _json(response, 'GraphSchema');
+  }
+
+  /// The `k` cheapest loopless paths between two nodes, cheapest first
+  /// (default 3, at most 20). Without `weightProperty` every edge costs
+  /// 1.
+  Future<Map<String, dynamic>> graphKShortestPaths(
+    String graph,
+    String from,
+    String to, {
+    int? k,
+    GraphDirection direction = GraphDirection.outgoing,
+    String? label,
+    String? weightProperty,
+    String? database,
+  }) async {
+    final response = await _graph(
+        'KShortestPaths',
+        {
+          'graph': graph,
+          'from': from,
+          'to': to,
+          'k': k,
+          'direction': direction.wire,
+          'label': label,
+          'weight_property': weightProperty,
+        },
+        database);
+    return _json(response, 'KShortestPaths');
+  }
+
+  /// Every simple path between two nodes of at most `maxDepth` edges
+  /// (default 5, at most 10). `complete` says whether the enumeration
+  /// finished.
+  Future<Map<String, dynamic>> graphAllPaths(
+    String graph,
+    String from,
+    String to, {
+    GraphDirection direction = GraphDirection.outgoing,
+    String? label,
+    int? maxDepth,
+    int? limit,
+    String? database,
+  }) async {
+    final response = await _graph(
+        'AllPaths',
+        {
+          'graph': graph,
+          'from': from,
+          'to': to,
+          'direction': direction.wire,
+          'label': label,
+          'max_depth': maxDepth,
+          'limit': limit,
+        },
+        database);
+    return _json(response, 'AllPaths');
+  }
+
+  /// Betweenness, closeness or eigenvector centrality: the top `limit`
+  /// nodes (default 20) under `results`. `iterations` and `tolerance`
+  /// tune eigenvector only.
+  Future<Map<String, dynamic>> graphCentrality(
+    String graph,
+    CentralityMeasure measure, {
+    bool directed = true,
+    String? label,
+    int? limit,
+    int? iterations,
+    double? tolerance,
+    String? database,
+  }) async {
+    final response = await _graph(
+        'Centrality',
+        {
+          'graph': graph,
+          'measure': measure.wire,
+          'directed': directed,
+          'label': label,
+          'limit': limit,
+          'iterations': iterations,
+          'tolerance': tolerance,
+        },
+        database);
+    return _json(response, 'Centrality');
+  }
+
+  /// Communities by Louvain modularity optimisation, direction ignored,
+  /// largest first, with the partition's `modularity`.
+  Future<Map<String, dynamic>> graphCommunities(
+    String graph, {
+    String? label,
+    int? iterations,
+    int? limit,
+    String? database,
+  }) async {
+    final response = await _graph(
+        'Communities',
+        {
+          'graph': graph,
+          'label': label,
+          'iterations': iterations,
+          'limit': limit,
+        },
+        database);
+    return _json(response, 'Communities');
+  }
+
+  /// Triangles and clustering coefficients, direction ignored.
+  Future<Map<String, dynamic>> graphTriangleCount(
+    String graph, {
+    String? label,
+    int? limit,
+    String? database,
+  }) async {
+    final response = await _graph(
+        'TriangleCount',
+        {
+          'graph': graph,
+          'label': label,
+          'limit': limit,
+        },
+        database);
+    return _json(response, 'TriangleCount');
+  }
+
+  /// The nodes whose neighbour sets most resemble a node's, under
+  /// `results`.
+  Future<Map<String, dynamic>> graphNodeSimilarity(
+    String graph,
+    String node, {
+    GraphDirection direction = GraphDirection.both,
+    String? label,
+    SimilarityMetric metric = SimilarityMetric.jaccard,
+    int? limit,
+    String? database,
+  }) async {
+    final response = await _graph(
+        'NodeSimilarity',
+        {
+          'graph': graph,
+          'node': node,
+          'direction': direction.wire,
+          'label': label,
+          'metric': metric.wire,
+          'limit': limit,
+        },
+        database);
+    return _json(response, 'NodeSimilarity');
+  }
+
+  /// Check a graph's stored records against each other and against the
+  /// resident mirror: dangling edges, undecodable records, misfiled
+  /// records and any disagreement between mirror and storage.
+  Future<Map<String, dynamic>> graphCheckConsistency(
+    String graph, {
+    String? database,
+  }) async {
+    final response = await _graph(
+        'CheckConsistency',
+        {
+          'graph': graph,
+        },
+        database);
+    return _json(response, 'CheckConsistency');
+  }
+
+  /// Index node properties for finding nodes. With one property it is a
+  /// property index, with several a composite one; `label` limits it to
+  /// nodes carrying that label.
+  Future<void> graphCreateNodeIndex(
+    String graph,
+    String name,
+    List<String> properties, {
+    String? label,
+    String? database,
+  }) async {
+    await _graph(
+        'CreateNodeIndex',
+        {
+          'graph': graph,
+          'name': name,
+          'properties': properties,
+          'label': label,
+        },
+        database);
+  }
+
+  /// Enforce a rule on a property of every node (or, with target `edge`,
+  /// every relationship) carrying a label. Refused when a stored record
+  /// already breaks it; afterwards every write that would break it is
+  /// refused.
+  Future<void> graphCreateConstraint(
+    String graph,
+    String name,
+    String label,
+    String property,
+    ConstraintKind kind, {
+    ConstraintTarget target = ConstraintTarget.node,
+    String? database,
+  }) async {
+    await _graph(
+        'CreateConstraint',
+        {
+          'graph': graph,
+          'name': name,
+          'label': label,
+          'property': property,
+          'kind': kind.wire,
+          'target': target.wire,
+        },
+        database);
+  }
+
+  /// Drop an index or a constraint by name.
+  Future<void> graphDropSchemaObject(
+    String graph,
+    String name, {
+    String? database,
+  }) async {
+    await _graph(
+        'DropSchemaObject',
+        {
+          'graph': graph,
+          'name': name,
+        },
+        database);
+  }
+
+  /// A graph's `indexes` and `constraints`.
+  Future<Map<String, dynamic>> graphListSchemaObjects(
+    String graph, {
+    String? database,
+  }) async {
+    final response = await _graph(
+        'ListSchemaObjects',
+        {
+          'graph': graph,
+        },
+        database);
+    return _json(response, 'ListSchemaObjects');
+  }
+
+  /// Nodes with a label (when given) whose properties equal the given
+  /// values, in id order. `plan` says whether an index, the label index
+  /// or a scan answered.
+  Future<Map<String, dynamic>> graphFindNodes(
+    String graph, {
+    String? label,
+    Map<String, Object?> properties = const {},
+    int? limit,
+    String? database,
+  }) async {
+    final response = await _graph(
+        'FindNodes',
+        {
+          'graph': graph,
+          'label': label,
+          'properties': properties,
+          'limit': limit,
+        },
+        database);
+    return _json(response, 'FindNodes');
+  }
+
+  /// Import nodes and edges from CSV text as one atomic batch, so
+  /// constraints apply. Answers `nodes` and `edges`.
+  Future<Map<String, dynamic>> graphImportCsv(
+    String graph, {
+    String? nodes,
+    String? edges,
+    String? database,
+  }) async {
+    final response = await _graph(
+        'ImportCsv',
+        {
+          'graph': graph,
+          'nodes': nodes,
+          'edges': edges,
+        },
+        database);
+    return _json(response, 'ImportCsv');
+  }
+
+  /// PageRank over edge direction: the top `limit` nodes (default 20)
+  /// under `ranks`. `damping` defaults to 0.85.
+  Future<Map<String, dynamic>> graphPageRank(
+    String graph, {
+    double? damping,
+    int? iterations,
+    double? tolerance,
+    String? label,
+    int? limit,
+    String? database,
+  }) async {
+    final response = await _graph(
+        'PageRank',
+        {
+          'graph': graph,
+          'damping': damping,
+          'iterations': iterations,
+          'tolerance': tolerance,
+          'label': label,
+          'limit': limit,
+        },
+        database);
+    return _json(response, 'PageRank');
+  }
+
+  /// Run a Cypher write: `CREATE`, `MERGE`, `SET`, `REMOVE` or `[DETACH]
+  /// DELETE`, optionally after `MATCH ... [WHERE ...]`. Given a
+  /// transaction id as `txn`, the statement is queued rather than
+  /// applied.
+  Future<Map<String, dynamic>> graphExecute(
+    String graph,
+    String cypher, {
+    String? txn,
+    String? database,
+  }) async {
+    final response = await _graph(
+        'Execute',
+        {
+          'graph': graph,
+          'cypher': cypher,
+        },
+        database,
+        txn);
+    return _json(response, 'Execute');
+  }
+
+  /// Open a transaction on a graph, returning its id. An execute given
+  /// that id as `txn` is queued until the transaction commits.
+  Future<String> graphBeginTransaction(
+    String graph, {
+    String? database,
+  }) async {
+    final response = await _graph(
+        'BeginTransaction',
+        {
+          'graph': graph,
+        },
+        database);
+    return _json(response, 'BeginTransaction')['transaction'] as String;
+  }
+
+  /// Apply every statement queued in a graph transaction as one: all of
+  /// them or none.
+  Future<Map<String, dynamic>> graphCommitTransaction(
+    String graph,
+    String txn, {
+    String? database,
+  }) async {
+    final response = await _graph(
+        'CommitTransaction',
+        {
+          'graph': graph,
+        },
+        database,
+        txn);
+    return _json(response, 'CommitTransaction');
+  }
+
+  /// Discard a graph transaction and its queued statements.
+  Future<void> graphRollbackTransaction(
+    String graph,
+    String txn, {
+    String? database,
+  }) async {
+    await _graph(
+        'RollbackTransaction',
+        {
+          'graph': graph,
+        },
+        database,
+        txn);
+  }
+
   // ---- LLM -----------------------------------------------------------------
 
   /// Export the schema catalogue, rendered for a model or for a person.
@@ -2006,11 +4272,12 @@ class TriCore {
   Future<Response> _document(
     String variant,
     Map<String, Object?> body,
-    String? database,
-  ) =>
+    String? database, [
+    String? txn,
+  ]) =>
       request({
         'Document': {variant: body},
-      }, database: database);
+      }, database: database, txn: txn);
 
   Future<Response> _vector(
     String variant,
@@ -2024,11 +4291,12 @@ class TriCore {
   Future<Response> _graph(
     String variant,
     Map<String, Object?> body,
-    String? database,
-  ) =>
+    String? database, [
+    String? txn,
+  ]) =>
       request({
         'Graph': {variant: body},
-      }, database: database);
+      }, database: database, txn: txn);
 
   Future<int> _cacheListPush(
     String variant,
@@ -2195,6 +4463,126 @@ class TriCore {
     return values;
   }
 
+  static int? _intOrNull(Object? value) => value is int ? value : null;
+
+  static double? _doubleOrNull(Object? value) =>
+      value is num ? value.toDouble() : null;
+
+  static List<String> _strings(Object? values) =>
+      values is List ? [for (final value in values) '$value'] : const [];
+
+  static Map<String, dynamic> _map(Object? value) =>
+      value is Map ? Map<String, dynamic>.from(value) : const {};
+
+  static List<Map<String, dynamic>> _maps(Object? values) => values is List
+      ? [
+          for (final value in values)
+            if (value is Map) Map<String, dynamic>.from(value),
+        ]
+      : const [];
+
+  static List<Uint8List?> _cacheValues(Response response, String what) {
+    if (!response.hasArm('CacheValues')) {
+      throw ProtocolException(
+        'expected CacheValues for $what, got ${response.kind}',
+      );
+    }
+    final values = response.arm('CacheValues');
+    return values is List
+        ? [for (final value in values) value == null ? null : _toBytes(value)]
+        : const [];
+  }
+
+  /// A blocking pop answers `[key, value]`, or `[null, null]` when the wait
+  /// ran out.
+  static MapEntry<String, Uint8List>? _popped(Response response, String what) {
+    final values = _cacheValues(response, what);
+    if (values.length != 2 || values[0] == null || values[1] == null) {
+      return null;
+    }
+    return MapEntry(utf8.decode(values[0]!, allowMalformed: true), values[1]!);
+  }
+
+  static List<Map<String, Object?>> _entries(Map<String, Object> entries) {
+    if (entries.isEmpty) {
+      throw ArgumentError('entries must not be empty');
+    }
+    return [
+      for (final entry in entries.entries)
+        {'key': entry.key, 'value': _bytes(entry.value, 'value')},
+    ];
+  }
+
+  static List<Map<String, Object?>> _scored(Map<Object, double> members) {
+    if (members.isEmpty) {
+      throw ArgumentError('members must not be empty');
+    }
+    return [
+      for (final entry in members.entries)
+        {
+          'score': _score(entry.value),
+          'member': _bytes(entry.key, 'member'),
+        },
+    ];
+  }
+
+  static double _score(double score) {
+    if (score.isNaN || score.isInfinite) {
+      throw ArgumentError('a score must be a finite number');
+    }
+    return score;
+  }
+
+  /// A range read with scores answers `{member, score}` objects; without, the
+  /// members alone.
+  static List<ScoredMember> _scoredMembers(Map<String, dynamic> json) {
+    final members = json['members'];
+    if (members is! List) return const [];
+    return [
+      for (final member in members)
+        if (member is Map)
+          ScoredMember(
+            _toBytes(member['member']),
+            _doubleOrNull(member['score']),
+          )
+        else
+          ScoredMember(_toBytes(member), null),
+    ];
+  }
+
+  static List<CacheOpResult> _opResults(Map<String, dynamic> json) {
+    final results = json['results'];
+    return results is List
+        ? [for (final result in results) CacheOpResult.fromJson(result)]
+        : const [];
+  }
+
+  static List<VectorHit> _hits(Object? results) {
+    if (results is! List) return const [];
+    return [
+      for (final hit in results)
+        if (hit is Map)
+          VectorHit(
+            '${hit['id']}',
+            hit['score'] is num ? (hit['score'] as num).toDouble() : 0,
+            hit['metadata'] is Map
+                ? Map<String, dynamic>.from(hit['metadata'] as Map)
+                : const {},
+            vector: hit['vector'] is List
+                ? [
+                    for (final component in hit['vector'] as List)
+                      (component as num).toDouble(),
+                  ]
+                : null,
+            reason: hit['reason'] is String ? hit['reason'] as String : null,
+            matched: hit['matched'] is int ? hit['matched'] as int : null,
+          ),
+    ];
+  }
+
+  static List<List<VectorHit>> _hitLists(Object? results) =>
+      results is List ? [for (final list in results) _hits(list)] : const [];
+
   static String _errorText(Object? body) {
     if (body is Map) {
       final message = body['message'] ?? body['error'];
@@ -2227,8 +4615,24 @@ class VectorHit {
   /// Whatever metadata was stored with it.
   final Map<String, dynamic> metadata;
 
+  /// The stored vector, when the search asked for vectors.
+  final List<double>? vector;
+
+  /// A one-line plain-language reason, when the search asked to explain.
+  final String? reason;
+
+  /// How many of a multi-query search's queries ranked this vector.
+  final int? matched;
+
   /// A hit with this id, score and metadata.
-  const VectorHit(this.id, this.score, this.metadata);
+  const VectorHit(
+    this.id,
+    this.score,
+    this.metadata, {
+    this.vector,
+    this.reason,
+    this.matched,
+  });
 
   @override
   String toString() => 'VectorHit($id, $score)';

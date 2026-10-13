@@ -4,6 +4,39 @@ All notable changes to this package are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 0.3.0
+
+Every method added here needs a server at **0.1.0-rc.3 or later**. An older
+server does not know the operation and answers it with an error.
+
+### Added
+
+- 116 methods, one for each operation the server gained since 0.1.0-rc.2. The
+  README lists every one beside the server operation it sends.
+  - Cache (53): sorted sets, locks with fencing tokens, bitmaps, HyperLogLog,
+    multi-key reads and writes, conditional and atomic read-and-change writes,
+    stale-while-revalidate reads, list moves and blocking pops, set algebra,
+    pipelines, transactions and scripts, publish and poll, namespace limits and
+    statistics.
+  - Documents (13): `documentReplace`, `documentInsertMany`,
+    `documentDeleteMany`, `documentBulkWrite`, `documentExplain`, collection
+    options, renaming, index rebuilds and transactions spanning requests.
+  - Vectors (21): batch upserts and deletes, batch, multi-query and
+    by-example searches, named vectors, aliases, filters, counts, partitions,
+    text embedding, index statistics and collection configuration.
+  - Graphs (29): bulk writes, in-place updates, traversals and algorithms
+    (components, cycles, k shortest paths, centrality, communities, PageRank
+    and more), indexes and constraints, CSV import, Cypher writes and
+    transactions.
+- `BulkOp`, the four kinds of item a `documentBulkWrite` takes, and `CacheOp`,
+  the operations a cache pipeline, transaction or script runs.
+- `ScoredMember`, `ScoreBound`, `CacheExpiry`, `FreshRead`, `CacheOpResult`,
+  `VectorSearchOptions` and the enums the new methods take.
+- `txn` on `request` and on the document reads and writes, naming the document
+  transaction a call runs inside.
+- `VectorHit.vector`, `VectorHit.reason` and `VectorHit.matched`, for the
+  searches that return them.
+
 ## 0.2.0
 
 ### Added

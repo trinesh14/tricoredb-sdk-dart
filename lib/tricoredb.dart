@@ -22,6 +22,7 @@ export 'src/builders.dart';
 export 'src/client.dart';
 export 'src/errors.dart';
 export 'src/frame.dart' show Frame, FrameHeader;
+export 'src/operations.dart' hide cacheBytes;
 export 'src/options.dart';
 export 'src/params.dart' show Blob, Decimal, Params;
 export 'src/pool.dart';

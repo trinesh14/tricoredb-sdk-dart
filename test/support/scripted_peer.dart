@@ -57,6 +57,9 @@ class ScriptedPeer {
   final ServerSocket _server;
   final List<Step> _steps;
 
+  /// The payload of every REQUEST frame received, decoded, in order.
+  final List<Map<String, dynamic>> requests = [];
+
   ScriptedPeer._(this._server, this._steps) {
     _server.listen(_serve);
   }
@@ -155,8 +158,15 @@ class ScriptedPeer {
               (pending[4] << 8) |
               pending[5];
           if (queue.length < length) return;
-          for (var i = 0; i < length; i++) {
-            queue.removeFirst();
+          final payload = <int>[
+            for (var i = 0; i < length; i++) queue.removeFirst(),
+          ];
+          if (pending[1] == Frame.request) {
+            requests.add(
+              Map<String, dynamic>.from(
+                json.decode(utf8.decode(payload)) as Map,
+              ),
+            );
           }
           pending = <int>[];
           onFrame();
