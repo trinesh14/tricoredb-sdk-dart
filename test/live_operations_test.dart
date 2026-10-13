@@ -28,6 +28,34 @@ void main() {
 
   String text(Uint8List? bytes) => utf8.decode(bytes!);
 
+  test('a nested BEGIN opens a block the outer transaction outlives', () async {
+    final table = uniqueName('nested');
+    await db.execute('CREATE TABLE $table (id INT PRIMARY KEY, n INT)');
+
+    await db.begin();
+    await db.execute('INSERT INTO $table VALUES (?, ?)', [1, 1]);
+    final inner = await db.begin();
+    expect(inner['nested_depth'], 1);
+    await db.execute('INSERT INTO $table VALUES (?, ?)', [2, 2]);
+    await db.rollback();
+    expect(db.inTransaction, isTrue,
+        reason: 'the rollback ended the inner block, not the transaction');
+
+    await db.begin();
+    await db.execute('INSERT INTO $table VALUES (?, ?)', [3, 3]);
+    await db.commit();
+    expect(db.inTransaction, isTrue,
+        reason: 'the commit released the inner block, not the transaction');
+
+    await db.commit();
+    expect(db.inTransaction, isFalse);
+    final rows = await db.query('SELECT id FROM $table ORDER BY id');
+    expect([for (final row in rows) row[0]], ['1', '3'],
+        reason: 'the outer write and the committed block survive; the '
+            'rolled-back block is gone');
+    await db.execute('DROP TABLE $table');
+  }, skip: skip);
+
   test('sorted sets rank, range and re-score their members', () async {
     final ns = uniqueName('zset');
     final added = await db.cacheSortedAdd(ns, 'z', {'a': 1.5, 'b': 2, 'c': 3});

@@ -37,6 +37,15 @@ server does not know the operation and answers it with an error.
 - `VectorHit.vector`, `VectorHit.reason` and `VectorHit.matched`, for the
   searches that return them.
 
+### Fixed
+
+- `inTransaction` stays true while an outer transaction is open. Since
+  2026-09-29 the server opens a nested block when `BEGIN` is sent inside a
+  transaction, and the `COMMIT` or `ROLLBACK` that ends the block (answered with
+  `nested_depth`) leaves the outer transaction open. The client used to report
+  the transaction as over, so a pool could lend the connection on with it
+  still open.
+
 ## 0.2.0
 
 ### Added

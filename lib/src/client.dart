@@ -4256,8 +4256,12 @@ class TriCore {
       if (keyword != 'BEGIN') _transactionOpen = false;
       rethrow;
     }
-    _transactionOpen = keyword == 'BEGIN';
-    return _json(response, keyword);
+    final json = _json(response, keyword);
+    // A BEGIN inside an open transaction opens a nested block, and the COMMIT
+    // or ROLLBACK that ends it answers with `nested_depth`: the outer
+    // transaction is still open.
+    _transactionOpen = keyword == 'BEGIN' || json.containsKey('nested_depth');
+    return json;
   }
 
   Future<Response> _cache(
